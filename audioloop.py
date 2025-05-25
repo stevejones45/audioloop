@@ -8,13 +8,55 @@ import os
 
 class MultiTrackLooper:
     def __init__(self):
+        # Get host APIs and devices info
+        hostapis = sd.query_hostapis()
+        devices = sd.query_devices()
+        
+        # Look for headphone mic and output in DirectSound or WASAPI
+        input_device_id = None
+        output_device_id = None
+        
+        # First try to find DirectSound devices (usually more stable)
+        for i, device in enumerate(devices):
+            hostapi_idx = device['hostapi']
+            hostapi_name = hostapis[hostapi_idx]['name']
+            
+            if 'DirectSound' in hostapi_name:
+                if device['max_input_channels'] > 0 and 'External Microphone' in device['name']:
+                    input_device_id = i
+                    print(f"Found DirectSound input: {device['name']} (device {i})")
+                elif device['max_output_channels'] > 0 and 'Headphones' in device['name']:
+                    output_device_id = i
+                    print(f"Found DirectSound output: {device['name']} (device {i})")
+        
+        # If no external mic found, look for any microphone in DirectSound
+        if input_device_id is None:
+            for i, device in enumerate(devices):
+                hostapi_idx = device['hostapi']
+                hostapi_name = hostapis[hostapi_idx]['name']
+                
+                if 'DirectSound' in hostapi_name and device['max_input_channels'] > 0:
+                    if 'Microphone' in device['name']:
+                        input_device_id = i
+                        print(f"Found DirectSound input: {device['name']} (device {i})")
+                        break
+        
+        # If still not found, fall back to defaults
+        if input_device_id is None:
+            input_device_id = sd.default.device[0]
+            print(f"Using default input device: {devices[input_device_id]['name']}")
+        if output_device_id is None:
+            output_device_id = sd.default.device[1]
+            print(f"Using default output device: {devices[output_device_id]['name']}")
+            
         self.sample_rate = 44100
-        self.channels = 2  # Stereo
-        self.dtype = np.int16
+        self.channels = 2
+        
+        self.dtype = 'float32'  # Use float32 which is more universally supported
         self.recording = False
         self.playing = False
         self.current_track = 0
-        self.master_length = None  # Length of first recorded track
+        self.master_length = None
         
         # 4 tracks, each can hold audio data
         self.tracks = [None, None, None, None]
@@ -26,34 +68,34 @@ class MultiTrackLooper:
         self.audio_buffer = []
         self.playback_position = 0
         
-        # Audio streams
-        self.input_stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype=self.dtype,
-            callback=self.audio_input_callback
-        )
+        # Audio streams - don't create them until needed
+        self.input_stream = None
+        self.output_stream = None
         
-        self.output_stream = sd.OutputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype=self.dtype,
-            callback=self.audio_output_callback
-        )
+        # Store device IDs for later use
+        self.input_device_id = input_device_id
+        self.output_device_id = output_device_id
         
+        print(f"Audio devices ready - Input: {input_device_id}, Output: {output_device_id}")
+    
     def audio_input_callback(self, indata, frames, time, status):
         """Callback for audio input"""
+        if status:
+            print(f"Input status: {status}")
         if self.recording:
             self.audio_queue.put(indata.copy())
     
     def audio_output_callback(self, outdata, frames, time, status):
         """Mix and play all enabled tracks"""
+        if status:
+            print(f"Output status: {status}")
+            
         if not self.playing or self.master_length is None:
             outdata.fill(0)
             return
         
         # Create mix buffer
-        mix = np.zeros_like(outdata, dtype=np.float32)
+        mix = np.zeros_like(outdata)
         
         # Mix all enabled tracks
         for i, track in enumerate(self.tracks):
@@ -64,18 +106,15 @@ class MultiTrackLooper:
                 samples_to_copy = end_pos - start_pos
                 
                 # Add track to mix with volume
-                track_float = track[start_pos:end_pos].astype(np.float32) / 32768.0
-                mix[:samples_to_copy] += track_float * self.track_volumes[i]
+                mix[:samples_to_copy] += track[start_pos:end_pos] * self.track_volumes[i]
                 
                 # Handle loop wrap
                 if samples_to_copy < frames:
                     remaining = frames - samples_to_copy
-                    track_float = track[:remaining].astype(np.float32) / 32768.0
-                    mix[samples_to_copy:] += track_float * self.track_volumes[i]
+                    mix[samples_to_copy:] += track[:remaining] * self.track_volumes[i]
         
-        # Clip and convert back to int16
-        mix = np.clip(mix, -1.0, 1.0)
-        outdata[:] = (mix * 32768).astype(self.dtype)
+        # Clip to prevent distortion
+        outdata[:] = np.clip(mix, -1.0, 1.0)
         
         self.playback_position += frames
     
@@ -87,7 +126,26 @@ class MultiTrackLooper:
         self.current_track = track_num
         self.recording = True
         self.audio_buffer = []
-        self.input_stream.start()
+        
+        # Recreate input stream if needed
+        try:
+            if self.input_stream:
+                self.input_stream.close()
+            
+            self.input_stream = sd.InputStream(
+                device=self.input_device_id,
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype=self.dtype,
+                callback=self.audio_input_callback,
+                latency='low'
+            )
+            self.input_stream.start()
+            print(f"Recording track {track_num + 1}")
+        except Exception as e:
+            print(f"Error starting recording: {e}")
+            self.recording = False
+            return
         
         # Start recording thread
         threading.Thread(target=self._record_thread, daemon=True).start()
@@ -107,7 +165,23 @@ class MultiTrackLooper:
             return
         
         self.recording = False
-        self.input_stream.stop()
+        
+        # Stop and close input stream
+        try:
+            if self.input_stream:
+                self.input_stream.stop()
+                self.input_stream.close()
+                self.input_stream = None
+            print("Recording stopped")
+        except Exception as e:
+            print(f"Error stopping recording: {e}")
+        
+        # Clear the queue
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
         
         if self.audio_buffer:
             recorded_audio = np.concatenate(self.audio_buffer, axis=0)
@@ -130,12 +204,41 @@ class MultiTrackLooper:
     
     def toggle_playback(self):
         """Toggle master playback"""
+        if self.master_length is None:
+            print("No tracks recorded yet")
+            return
+            
         self.playing = not self.playing
         if self.playing:
             self.playback_position = 0
-            self.output_stream.start()
+            # Recreate output stream if needed
+            try:
+                if self.output_stream:
+                    self.output_stream.close()
+                
+                self.output_stream = sd.OutputStream(
+                    device=self.output_device_id,
+                    samplerate=self.sample_rate,
+                    channels=self.channels,
+                    dtype=self.dtype,
+                    callback=self.audio_output_callback,
+                    latency='low'
+                )
+                self.output_stream.start()
+                print("Playback started")
+            except Exception as e:
+                print(f"Error starting playback: {e}")
+                self.playing = False
         else:
-            self.output_stream.stop()
+            # Stop and close stream
+            try:
+                if self.output_stream:
+                    self.output_stream.stop()
+                    self.output_stream.close()
+                    self.output_stream = None
+                print("Playback stopped")
+            except Exception as e:
+                print(f"Error stopping playback: {e}")
     
     def clear_track(self, track_num):
         """Clear a specific track"""
@@ -163,13 +266,12 @@ class MultiTrackLooper:
         # Downsample for display
         downsample = 500
         display_data = self.tracks[track_num][::downsample, 0]  # Use left channel
-        normalized = display_data.astype(np.float32) / 32768.0
         
         # Create time axis
-        time_axis = np.arange(len(normalized)) * downsample / self.sample_rate
+        time_axis = np.arange(len(display_data)) * downsample / self.sample_rate
         
         # Update plot
-        dpg.set_value(f"track_{track_num}_series", [time_axis.tolist(), normalized.tolist()])
+        dpg.set_value(f"track_{track_num}_series", [time_axis.tolist(), display_data.tolist()])
     
     def save_mix(self, filename):
         """Save the current mix to a WAV file"""
@@ -181,12 +283,11 @@ class MultiTrackLooper:
         
         for i, track in enumerate(self.tracks):
             if track is not None and self.track_enabled[i]:
-                track_float = track.astype(np.float32) / 32768.0
-                mix += track_float * self.track_volumes[i]
+                mix += track * self.track_volumes[i]
         
-        # Clip and convert
+        # Clip and convert to int16 for WAV
         mix = np.clip(mix, -1.0, 1.0)
-        mix_int16 = (mix * 32768).astype(self.dtype)
+        mix_int16 = (mix * 32767).astype(np.int16)
         
         # Save
         if not filename.endswith('.wav'):
@@ -202,8 +303,18 @@ class MultiTrackLooper:
         
         return filepath
 
-# Create app instance
-app = MultiTrackLooper()
+# Create app instance 
+try:
+    app = MultiTrackLooper()
+except Exception as e:
+    print(f"Failed to initialize audio: {e}")
+    print("\nTroubleshooting:")
+    print("1. Make sure no other audio applications are using the device")
+    print("2. Try closing and reopening the terminal")
+    print("3. Check Windows sound settings")
+    print("\nAvailable devices:")
+    print(sd.query_devices())
+    raise
 
 # GUI callbacks
 def record_button_callback(sender, app_data, user_data):
@@ -211,30 +322,30 @@ def record_button_callback(sender, app_data, user_data):
     if app.recording and app.current_track == track_num:
         app.stop_recording()
         dpg.set_item_label(f"record_btn_{track_num}", f"Record Track {track_num + 1}")
-        dpg.configure_item(f"record_btn_{track_num}", button_color=(51, 51, 55))
+        dpg.bind_item_theme(f"record_btn_{track_num}", "button_theme_default")
     elif not app.recording:
         app.start_recording(track_num)
         dpg.set_item_label(f"record_btn_{track_num}", "Stop Recording")
-        dpg.configure_item(f"record_btn_{track_num}", button_color=(150, 0, 0))
+        dpg.bind_item_theme(f"record_btn_{track_num}", "button_theme_recording")
 
 def play_button_callback():
     app.toggle_playback()
     if app.playing:
         dpg.set_item_label("play_btn", "Stop All")
-        dpg.configure_item("play_btn", button_color=(0, 150, 0))
+        dpg.bind_item_theme("play_btn", "button_theme_playing")
     else:
         dpg.set_item_label("play_btn", "Play All")
-        dpg.configure_item("play_btn", button_color=(51, 51, 55))
+        dpg.bind_item_theme("play_btn", "button_theme_default")
 
 def mute_callback(sender, app_data, user_data):
     track_num = user_data
     app.toggle_track(track_num)
     if app.track_enabled[track_num]:
         dpg.set_item_label(f"mute_btn_{track_num}", "Mute")
-        dpg.configure_item(f"mute_btn_{track_num}", button_color=(51, 51, 55))
+        dpg.bind_item_theme(f"mute_btn_{track_num}", "button_theme_default")
     else:
         dpg.set_item_label(f"mute_btn_{track_num}", "Muted")
-        dpg.configure_item(f"mute_btn_{track_num}", button_color=(150, 150, 0))
+        dpg.bind_item_theme(f"mute_btn_{track_num}", "button_theme_muted")
 
 def clear_callback(sender, app_data, user_data):
     track_num = user_data
@@ -256,6 +367,31 @@ def save_callback():
 
 # Create GUI
 dpg.create_context()
+
+# Create button themes for different states
+with dpg.theme(tag="button_theme_default"):
+    with dpg.theme_component(dpg.mvButton):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (51, 51, 55))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (71, 71, 75))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (91, 91, 95))
+
+with dpg.theme(tag="button_theme_recording"):
+    with dpg.theme_component(dpg.mvButton):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (150, 0, 0))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (170, 20, 20))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (190, 40, 40))
+
+with dpg.theme(tag="button_theme_playing"):
+    with dpg.theme_component(dpg.mvButton):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 150, 0))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (20, 170, 20))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (40, 190, 40))
+
+with dpg.theme(tag="button_theme_muted"):
+    with dpg.theme_component(dpg.mvButton):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (150, 150, 0))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (170, 170, 20))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (190, 190, 40))
 
 # Custom theme for track colors
 with dpg.theme() as track_theme:
@@ -311,6 +447,9 @@ with dpg.window(label="4-Track Looper", tag="main_window"):
         dpg.add_button(label="Save Mix", callback=save_callback, width=100)
     
     dpg.add_text("", tag="status_text")
+    
+    # Audio info
+    dpg.add_text(f"Audio: {app.sample_rate}Hz, {app.channels}ch", color=(128, 128, 128))
 
 # Update loop length display
 def update_loop_length():
@@ -336,6 +475,8 @@ def update_timer():
 dpg.start_dearpygui()
 
 # Cleanup
-app.input_stream.close()
-app.output_stream.close()
+if app.input_stream:
+    app.input_stream.close()
+if app.output_stream:
+    app.output_stream.close()
 dpg.destroy_context()
